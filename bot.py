@@ -33,7 +33,7 @@ Zig_Zag lounge — бот заказов для кальянной (единый
   КЛАВИАТУРЫ               — все inline/reply-клавиатуры
   ХЕНДЕЛЕРЫ                — дальше обработчики (ПОРЯДОК ВАЖЕН — не переставлять):
     ГРАФИКИ (PNG)          — картинки к /stats и /loyalty
-    админ-команды          — /stats /orders /timing
+    админ-команды          — /stats /orders /timing /backup
     /stock и /recipe       — склад, таблица, Excel, 📜 история, рецепты; /bookings
     кнопки статусов в канале — «Готов», оплата, отмена
     /start, ввод стола     — вход гостя
@@ -99,7 +99,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("zigzag")
 
-BOT_VERSION = "2026-10-13-v9"
+BOT_VERSION = "2026-10-13-v11"
 
 # Все временные метки бота — московские (UTC+3, переход на летнее время отменён)
 _MSK = timezone(timedelta(hours=3), name="MSK")
@@ -449,6 +449,11 @@ def db_init() -> None:
             CREATE INDEX IF NOT EXISTS ix_orders_user ON orders(user_id, created_at);
             CREATE INDEX IF NOT EXISTS ix_rsv_user ON reservations(user_id, status);
             CREATE INDEX IF NOT EXISTS ix_stock_moves_ing ON stock_moves(ingredient_id, id);
+            -- позиции меню, для которых склад уже создавался (заглушка — один раз)
+            CREATE TABLE IF NOT EXISTS stock_seeded (
+                item_id    TEXT PRIMARY KEY,
+                created_at TEXT
+            );
             """
         )
 
@@ -909,15 +914,23 @@ MENU = _load_menu()
 
 
 def seed_stock_from_menu() -> None:
-    """Строки склада для всех позиций меню: позиция = ингредиент (единица «шт»),
-    рецепт 1 порция = 1 шт. Идемпотентно — существующие рецепты и одноимённые
-    позиции не трогаем. qty=999 — заглушка, замените реальным остатком."""
+    """Строки склада для НОВЫХ позиций меню: позиция = ингредиент (единица «шт»),
+    рецепт 1 порция = 1 шт. qty=999 — заглушка, замените реальным остатком.
+    Каждая позиция меню обрабатывается один раз (таблица stock_seeded): если
+    заглушку или рецепт удалили вручную, после перезапуска они НЕ вернутся."""
     STOCK_WARNINGS[:] = stock_apply_renames()   # сначала — новые названия из STOCK_RENAMES
     created_ings = created_recipes = 0
     now = _now()
     with _connect() as conn:
+        seeded = {r[0] for r in conn.execute("SELECT item_id FROM stock_seeded")}
         for cat in MENU.get("categories", []):
             for it in cat.get("items", []):
+                if it["id"] in seeded:
+                    continue  # уже обрабатывали — ручные правки склада не трогаем
+                conn.execute(
+                    "INSERT OR IGNORE INTO stock_seeded (item_id, created_at) VALUES (?, ?)",
+                    (it["id"], now),
+                )
                 has = conn.execute(
                     "SELECT 1 FROM recipes WHERE item_id = ? LIMIT 1", (it["id"],)
                 ).fetchone()
@@ -1450,11 +1463,19 @@ async def _stock_alerts(bot, affected: list[dict]) -> None:
             )
     if not lines:
         return
+    # длинный список — несколькими сообщениями (лимит Telegram 4096 символов)
+    chunks = ["📦 <b>Склад</b>"]
+    for ln in lines:
+        if len(chunks[-1]) + len(ln) + 1 > 3800:
+            chunks.append("📦 <b>Склад</b> (продолжение)")
+        chunks[-1] += "\n" + ln
     for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, "📦 <b>Склад</b>\n" + "\n".join(lines))
-        except Exception:
-            logger.info("Не удалось прислать склад-алерт админу %s", admin_id)
+        for text in chunks:
+            try:
+                await bot.send_message(admin_id, text)
+            except Exception:
+                logger.info("Не удалось прислать склад-алерт админу %s", admin_id)
+                break
 
 
 # ============================== ЛОЯЛЬНОСТЬ ==================================
@@ -2553,6 +2574,10 @@ def kb_pay(order_id: int) -> InlineKeyboardMarkup:
 # =============================== ХЕНДЕЛЕРЫ ==================================
 
 router = Router()
+# Бот работает только в личных чатах: в группах молчит — не отвечает на каждое
+# сообщение и не публикует админ-данные (/stats, /guest…) посторонним.
+# Кнопки персонала в канале — это нажатия (callback), их фильтр не касается.
+router.message.filter(F.chat.type == "private")
 
 
 class OrderFSM(StatesGroup):
@@ -3423,6 +3448,103 @@ async def cmd_timing(message: Message):
 
 
 # ------------------------------------- /stock и /recipe (админ) -------------
+# ------------------------------------------------ /backup -------------------
+# Резервная копия всей базы (заказы, брони, карты и баллы гостей, склад,
+# рецепты) — файлом админу в личку. Копия делается штатным backup SQLite:
+# согласованная, можно в любой момент, даже во время заказов.
+BACKUP_MAX_BYTES = 49 * 1024 * 1024  # бот может отправить файл до 50 МБ
+
+
+def db_backup_bytes() -> tuple[bytes, str, dict]:
+    """Копия базы → (байты файла, расширение «.db» или «.db.gz», сводка)."""
+    import gzip
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+
+            def cnt(sql: str) -> int:
+                try:
+                    return int(dst.execute(sql).fetchone()[0] or 0)
+                except sqlite3.Error:
+                    return 0
+
+            info = {
+                "integrity": str(dst.execute("PRAGMA integrity_check").fetchone()[0]),
+                "orders": cnt("SELECT COUNT(*) FROM orders"),
+                "rsv": cnt("SELECT COUNT(*) FROM reservations"),
+                "cards": cnt("SELECT COUNT(*) FROM guests WHERE phone IS NOT NULL"),
+                "points": cnt("SELECT COALESCE(SUM(delta), 0) FROM bonus_moves"),
+                "ings": cnt("SELECT COUNT(*) FROM ingredients"),
+            }
+        finally:
+            dst.close()
+            src.close()
+        data = Path(tmp).read_bytes()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    ext = ".db"
+    if len(data) > BACKUP_MAX_BYTES:  # очень большая база — сжимаем
+        data = gzip.compress(data)
+        ext = ".db.gz"
+    return data, ext, info
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    """Резервная копия базы файлом (только админам из ADMIN_IDS, только в личке)."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    wait = await message.answer("💾 Готовлю резервную копию базы…")
+    try:
+        data, ext, info = await asyncio.to_thread(db_backup_bytes)
+    except Exception:
+        logger.exception("Резервная копия базы не удалась")
+        await message.answer("❌ Не удалось сделать копию базы — подробности в логах Bothost.")
+        return
+    if len(data) > BACKUP_MAX_BYTES:
+        await message.answer(
+            f"❌ База слишком большая для отправки в Telegram "
+            f"({len(data) // (1024 * 1024)} МБ даже в сжатом виде). "
+            "Скачайте файл orders.db с сервера вручную."
+        )
+        return
+    now = _now_dt()
+    ok = info["integrity"] == "ok"
+    unpack = " (сначала распакуйте .gz)" if ext.endswith(".gz") else ""
+    caption = (
+        f"💾 <b>Резервная копия базы</b> · {now:%d.%m.%Y %H:%M}\n"
+        f"Заказов: {info['orders']} · броней: {info['rsv']} · карт гостей: {info['cards']}\n"
+        f"Баллов на картах: {info['points']} · позиций склада: {info['ings']}\n"
+        f"Проверка целостности: {'✅ в порядке' if ok else '⚠️ ' + esc(info['integrity'][:80])}\n\n"
+        "🔒 В файле телефоны гостей — храните у себя, не пересылайте посторонним.\n"
+        "♻️ Восстановление: остановите бота → положите этот файл в папку данных "
+        f"под именем <code>orders.db</code>{unpack} (сейчас база: "
+        f"<code>{esc(DB_PATH)}</code>) → запустите бота."
+    )
+    name = f"zigzag_backup_{now:%Y-%m-%d_%H%M}{ext}"
+    try:
+        await message.answer_document(BufferedInputFile(data, name), caption=caption[:1024])
+    except Exception:
+        logger.exception("Не удалось отправить резервную копию")
+        await message.answer("❌ Копия сделана, но Telegram не принял файл — попробуйте ещё раз.")
+        return
+    logger.info("Резервная копия базы (%d байт) отправлена админу %s",
+                len(data), message.from_user.id)
+    try:
+        await message.bot.delete_message(message.chat.id, wait.message_id)
+    except Exception:
+        pass
+
+
 class StockFSM(StatesGroup):
     qty = State()      # приход/расход: количество
     money = State()    # приход: сумма закупки (расчёт средней с/с)
@@ -3489,7 +3611,23 @@ async def _edit_or_send(message: Message, data: dict, text: str, kb) -> None:
         logger.exception("Не удалось отправить сообщение")
 
 
-def stock_list_text() -> str:
+SK_PAGE = 30  # позиций на странице «🗂 По позициям» (лимит Telegram — 100 кнопок)
+
+
+def _sk_page(ings: list[dict], page: int) -> tuple[list[dict], int, int]:
+    """Срез позиций для страницы → (позиции, номер страницы, всего страниц)."""
+    pages = max(1, -(-len(ings) // SK_PAGE))
+    page = min(max(0, int(page)), pages - 1)
+    return ings[page * SK_PAGE:(page + 1) * SK_PAGE], page, pages
+
+
+def _sk_page_of(ing_id: int) -> int:
+    """На какой странице «По позициям» находится позиция (для «🔙 Назад»)."""
+    ids = [int(i["id"]) for i in db_list_ingredients()]
+    return ids.index(int(ing_id)) // SK_PAGE if int(ing_id) in ids else 0
+
+
+def stock_list_text(page: int = 0) -> str:
     ings = db_list_ingredients()
     head = (
         "📦 <b>Склад</b>\n"
@@ -3497,8 +3635,14 @@ def stock_list_text() -> str:
     )
     if not ings:
         return head + "\n\nПока пусто — добавьте первую позицию кнопкой ниже."
-    lines = [head, ""]
-    for ing in ings:
+    chunk, page, pages = _sk_page(ings, page)
+    lines = [head]
+    if pages > 1:
+        first = page * SK_PAGE + 1
+        lines.append(f"Позиции {first}–{first + len(chunk) - 1} из {len(ings)} · "
+                     f"стр. {page + 1}/{pages}")
+    lines.append("")
+    for ing in chunk:
         mark = ""
         if float(ing["qty"]) <= 0:
             mark = " ⛔"
@@ -3507,7 +3651,14 @@ def stock_list_text() -> str:
         lines.append(
             f"• {esc(ing['name'])} — {_fmt_qty(ing['qty'])} {esc(ing['unit'])}{mark}"
         )
-    return "\n".join(lines)
+    return _fit_lines("\n".join(lines))
+
+
+def _fit_lines(text: str, limit: int = 3900) -> str:
+    """Укоротить текст до лимита Telegram по границе строки (не рвёт HTML-теги)."""
+    if len(text) <= limit:
+        return text
+    return text[:limit - 40].rsplit("\n", 1)[0] + "\n…(список сокращён)"
 
 
 def stock_detail_text(ing: dict) -> str:
@@ -3544,9 +3695,10 @@ def stock_detail_text(ing: dict) -> str:
     return "\n".join(lines)
 
 
-def kb_stock_list() -> InlineKeyboardMarkup:
+def kb_stock_list(page: int = 0) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for ing in db_list_ingredients():
+    chunk, page, pages = _sk_page(db_list_ingredients(), page)
+    for ing in chunk:
         rows.append(
             [
                 _btn(
@@ -3555,6 +3707,14 @@ def kb_stock_list() -> InlineKeyboardMarkup:
                 )
             ]
         )
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("◀️", f"sk:pg:{page - 1}"))
+        nav.append(_btn(f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(_btn("▶️", f"sk:pg:{page + 1}"))
+        rows.append(nav)
     rows.append([_btn("➕ Новая позиция", "skn"), _btn("📋 Таблица", "sx:table")])
     rows.append([_btn("📜 История", "sh:0:a:w:0"), _btn("✖ Закрыть", "sk:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3574,7 +3734,7 @@ def kb_stock_detail(ing_id: int) -> InlineKeyboardMarkup:
             [_btn("📏 Единица", f"sk:{ing_id}:unit"), _btn("✏️ Название", f"sk:{ing_id}:name")],
             [_btn("📜 История", f"sh:{ing_id}:a:m:0")],
             [_btn("🗑 Удалить позицию", f"sk:{ing_id}:rm")],
-            [_btn("🔙 Назад", "sk:list")],
+            [_btn("🔙 Назад", f"sk:pg:{_sk_page_of(ing_id)}")],
         ]
     )
 
@@ -3614,6 +3774,16 @@ async def cb_stock(cb: CallbackQuery, state: FSMContext):
                     f"(без изменения с/с)\n\n" + stock_detail_text(updated),
                     reply_markup=kb_stock_detail(ing["id"]),
                 )
+            except TelegramBadRequest:
+                pass
+            return
+        # --- «🗂 По позициям»: страница списка ---
+        if len(parts) == 3 and parts[1] == "pg":
+            await state.clear()
+            await cb.answer()
+            page = int(parts[2]) if parts[2].isdigit() and len(parts[2]) < 5 else 0
+            try:
+                await cb.message.edit_text(stock_list_text(page), reply_markup=kb_stock_list(page))
             except TelegramBadRequest:
                 pass
             return
@@ -4675,7 +4845,7 @@ async def cb_stock_table(cb: CallbackQuery, state: FSMContext):
                 L += [f"– {s}" for s in skipped[:20]]
             try:
                 await cb.message.edit_text(
-                    "\n".join(L)[:4000],
+                    _fit_lines("\n".join(L)),
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                         [_btn("📋 Таблица", "sx:table"), _btn("✏️ Ещё правки", "sx:bulk")]]))
             except TelegramBadRequest:
@@ -4984,8 +5154,9 @@ async def cb_recipe(cb: CallbackQuery, state: FSMContext):
                 rct_view_text(parts[2]), reply_markup=kb_rct_view(parts[2])
             )
             return
-        if parts[1] == "a":  # выбор ингредиента
+        if parts[1] == "a":  # выбор ингредиента (по страницам)
             item_id = parts[2]
+            page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() and len(parts[3]) < 5 else 0
             ings = db_list_ingredients()
             if not ings:
                 await cb.answer()
@@ -4997,14 +5168,25 @@ async def cb_recipe(cb: CallbackQuery, state: FSMContext):
                     ),
                 )
                 return
+            chunk, page, pages = _sk_page(ings, page)
             rows = [
                 [_btn(f"{i['name']} · {i['unit']}", f"rct:p:{item_id}:{i['id']}")]
-                for i in ings
+                for i in chunk
             ]
+            if pages > 1:
+                nav = []
+                if page > 0:
+                    nav.append(_btn("◀️", f"rct:a:{item_id}:{page - 1}"))
+                nav.append(_btn(f"{page + 1}/{pages}", "noop"))
+                if page < pages - 1:
+                    nav.append(_btn("▶️", f"rct:a:{item_id}:{page + 1}"))
+                rows.append(nav)
             rows.append([_btn("🔙 Назад", f"rct:i:{item_id}")])
             await cb.answer()
+            note = (f"\nСтр. {page + 1}/{pages} · позиций на складе: {len(ings)} (по алфавиту)"
+                    if pages > 1 else "")
             await cb.message.edit_text(
-                "➕ Какой ингредиент добавить?",
+                "➕ Какой ингредиент добавить?" + note,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
             return
@@ -5128,6 +5310,14 @@ def _from_staff_chat(cb: CallbackQuery) -> bool:
     return bool(uname) and uname == str(CHANNEL_ID).lstrip("@").lower()
 
 
+def _cb_id(raw: str) -> int:
+    """Номер заказа/брони из кнопки; мусор и огромные числа → ValueError."""
+    v = int(raw)
+    if not 0 < v < 2**62:
+        raise ValueError(raw)
+    return v
+
+
 async def _staff_guard(cb: CallbackQuery, deny: str) -> bool:
     """True — можно выполнять действие персонала. Иначе отвечает отказом."""
     if not _from_staff_chat(cb):
@@ -5143,7 +5333,7 @@ async def _staff_guard(cb: CallbackQuery, deny: str) -> bool:
 async def cb_status(cb: CallbackQuery):
     try:
         _, oid_raw, code = cb.data.split(":")
-        order_id = int(oid_raw)
+        order_id = _cb_id(oid_raw)
     except (ValueError, AttributeError):
         await cb.answer("Некорректный запрос", show_alert=True)
         return
@@ -5231,7 +5421,7 @@ async def cb_pay(cb: CallbackQuery):
     """Выбор способа оплаты: нал / безнал / перевод, баллы (или «Назад»)."""
     try:
         _, oid_raw, action = cb.data.split(":")
-        order_id = int(oid_raw)
+        order_id = _cb_id(oid_raw)
     except (ValueError, AttributeError):
         await cb.answer("Некорректный запрос", show_alert=True)
         return
@@ -6745,7 +6935,7 @@ async def rsv_cancel(cb: CallbackQuery, state: FSMContext):
 async def cb_rsv_status(cb: CallbackQuery):
     try:
         _, rid_raw, code = cb.data.split(":")
-        rid = int(rid_raw)
+        rid = _cb_id(rid_raw)
     except (ValueError, AttributeError):
         await cb.answer("Некорректный запрос", show_alert=True)
         return
@@ -6825,7 +7015,7 @@ async def cb_rsv_adjust(cb: CallbackQuery):
     """Правка фактического времени аренды VIP/PlayStation: ±15 минут."""
     try:
         _, rid_raw, sign = cb.data.split(":")
-        rid = int(rid_raw)
+        rid = _cb_id(rid_raw)
     except (ValueError, AttributeError):
         await cb.answer("Некорректный запрос", show_alert=True)
         return
@@ -6881,7 +7071,7 @@ async def cb_rsv_pay(cb: CallbackQuery):
     """Закрытие чека аренды: способ оплаты → статус «Оплачен»."""
     parts = cb.data.split(":")
     try:
-        rid = int(parts[1])
+        rid = _cb_id(parts[1])
     except (ValueError, IndexError):
         await cb.answer("Некорректный запрос", show_alert=True)
         return
@@ -8150,7 +8340,7 @@ async def on_forward(message: Message):
 
 
 async def _register_commands(bot: Bot) -> None:
-    """Чистое меню «/»: гостям 4 команды, админам — 11. Вызывается при старте
+    """Чистое меню «/»: гостям 5 команд, админам — 14. Вызывается при старте
     и при /help админа — список само-восстанавливается, если клиент Telegram
     показывает устаревший вариант или прошлая версия бота поставила мусор."""
     guest_cmds = [
@@ -8169,6 +8359,7 @@ async def _register_commands(bot: Bot) -> None:
         BotCommand(command="recipe", description="Рецепты позиций меню"),
         BotCommand(command="guest", description="Карта гостя: баллы по телефону/@нику"),
         BotCommand(command="loyalty", description="Аналитика программы лояльности"),
+        BotCommand(command="backup", description="Резервная копия базы (файл)"),
     ]
     # Полная зачистка старых списков (от прежних версий, в любой области)
     for _scope in (
@@ -8242,7 +8433,8 @@ async def cmd_help(message: Message, state: FSMContext):
             "/stock — остатки, себестоимость, 📜 история прихода и списаний\n"
             "/recipe — состав позиций для списания\n"
             "/guest — карта гостя по телефону/@нику: аналитика, баллы, начислить, списать, сменить номер\n"
-            "/loyalty — аналитика лояльности: топ гостей, «спящие», баллы\n\n"
+            "/loyalty — аналитика лояльности: топ гостей, «спящие», баллы\n"
+            "/backup — резервная копия базы файлом (заказы, брони, карты, склад)\n\n"
             f"🤖 Версия бота: <b>{BOT_VERSION}</b>" + reg_note
         )
 
