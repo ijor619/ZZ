@@ -99,7 +99,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("zigzag")
 
-BOT_VERSION = "2026-10-12-v6"
+BOT_VERSION = "2026-10-13-v7"
 
 # Все временные метки бота — московские (UTC+3, переход на летнее время отменён)
 _MSK = timezone(timedelta(hours=3), name="MSK")
