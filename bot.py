@@ -99,7 +99,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("zigzag")
 
-BOT_VERSION = "2026-10-13-v7"
+BOT_VERSION = "2026-10-13-v9"
 
 # Все временные метки бота — московские (UTC+3, переход на летнее время отменён)
 _MSK = timezone(timedelta(hours=3), name="MSK")
@@ -399,11 +399,18 @@ def db_init() -> None:
             # предзаказ: время прихода и (необязательно) бронь, к которой он
             "ALTER TABLE orders ADD COLUMN arrive_at TEXT",
             "ALTER TABLE orders ADD COLUMN rsv_id INTEGER",
+            # когда закрыт чек аренды (визит и выручка — по этому дню)
+            "ALTER TABLE reservations ADD COLUMN paid_at TEXT",
         ):
             try:
                 conn.execute(_stmt)
             except sqlite3.OperationalError:
                 pass  # колонка уже есть
+        # брони, оплаченные до появления paid_at: время оплаты = последнее изменение
+        conn.execute(
+            "UPDATE reservations SET paid_at = COALESCE(updated_at, created_at)"
+            " WHERE status = 'paid' AND paid_at IS NULL"
+        )
         conn.executescript(
             """
             -- карта лояльности гостя (ключ — Telegram id; телефон = номер карты)
@@ -666,8 +673,8 @@ def db_set_rsv_paid(rid: int, method: str, actual_min: int, price: int) -> None:
     with _connect() as conn:
         conn.execute(
             "UPDATE reservations SET status = 'paid', pay_method = ?,"
-            " actual_min = ?, price = ?, updated_at = ? WHERE id = ?",
-            (method, int(actual_min), int(price), _now(), rid),
+            " actual_min = ?, price = ?, updated_at = ?, paid_at = ? WHERE id = ?",
+            (method, int(actual_min), int(price), _now(), _now(), rid),
         )
 
 
@@ -1483,6 +1490,22 @@ def guest_card(user_id: int | None) -> dict | None:
     return g if g and g.get("phone") else None
 
 
+def db_guest_admin_set_phone(uid: int, phone: str) -> tuple[bool, dict | None]:
+    """Смена номера карты администратором: баллы и история остаются (ключ карты —
+    Telegram id). (False, владелец) — номер уже у другой карты."""
+    try:
+        with _connect() as conn:
+            owner = conn.execute("SELECT * FROM guests WHERE phone = ? AND user_id != ?",
+                                 (phone, int(uid))).fetchone()
+            if owner:
+                return False, dict(owner)
+            conn.execute("UPDATE guests SET phone = ?, phone_verified = 0, updated_at = ?"
+                         " WHERE user_id = ?", (phone, _now(), int(uid)))
+    except sqlite3.IntegrityError:   # номер успели занять параллельно
+        return False, None
+    return True, None
+
+
 def db_guest_touch(user) -> None:
     """Обновить @ник и имя у существующей карты (для поиска по нику)."""
     if not user:
@@ -1704,7 +1727,7 @@ def guest_stats(user_id: int) -> dict:
             "  WHERE user_id = ? AND status = 'paid'"
             " UNION SELECT date(created_at, '-6 hours') FROM bonus_moves"
             "  WHERE user_id = ? AND kind = 'offline'"
-            " UNION SELECT date FROM reservations"
+            " UNION SELECT date(COALESCE(paid_at, created_at), '-6 hours') FROM reservations"
             "  WHERE user_id = ? AND status = 'paid')",
             (user_id, user_id, user_id),
         ).fetchone()
@@ -1828,10 +1851,11 @@ def _an_events(conn: sqlite3.Connection, uid: int | None = None) -> list[dict]:
         ev.append({"uid": r["user_id"], "src": "offline", "m": int(r["amount"] or 0),
                    "day": _an_day(r["created_at"]), "hour": None, "pay": None})
     for r in conn.execute(
-        f"SELECT user_id, price, pay_method, date FROM reservations WHERE status = 'paid' {flt}", args
+        f"SELECT user_id, price, pay_method, COALESCE(paid_at, created_at) AS paid"
+        f" FROM reservations WHERE status = 'paid' {flt}", args
     ):
         try:
-            day = datetime.strptime(r["date"], "%Y-%m-%d").date()
+            day = _an_day(r["paid"])   # визит — рабочий день оплаты, как у заказов
         except (TypeError, ValueError):
             continue
         ev.append({"uid": r["user_id"], "src": "rent", "m": int(r["price"] or 0),
@@ -3065,7 +3089,8 @@ def db_stats_range(d_from: str, d_to: str) -> dict:
             for r in conn.execute(
                 "SELECT COALESCE(pay_method, '') AS m, COUNT(*) AS n,"
                 " COALESCE(SUM(price), 0) AS s FROM reservations"
-                " WHERE status = 'paid' AND substr(created_at, 1, 10) BETWEEN ? AND ?"
+                " WHERE status = 'paid'"
+                " AND substr(COALESCE(paid_at, created_at), 1, 10) BETWEEN ? AND ?"
                 " GROUP BY pay_method",
                 (d_from, d_to),
             )
@@ -5441,6 +5466,16 @@ async def _finish_phone(
     phone: str | None, message: Message, state: FSMContext, verified: bool = False
 ) -> None:
     data = await state.get_data()
+    card = guest_card(message.from_user.id if message.from_user else None)
+    if card and phone != card["phone"]:
+        await state.update_data(loyal_done=True, card_greeted=True)
+        await state.set_state(None)
+        await message.answer(
+            f"💎 Ваша карта: <b>{esc(card['phone'])}</b>. {CARD_PHONE_LOCKED}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await _proceed(data.get("next") or "order", message, state)
+        return
     if phone:
         ok, why = db_guest_set_phone(message.from_user, phone, verified)
         if not ok:
@@ -5498,6 +5533,16 @@ async def loyal_pick(cb: CallbackQuery, state: FSMContext):
         kind = cb.data.split(":", 1)[1]  # "loyal:first" → "first"
         if kind not in ("first", "reg"):
             await cb.answer("Ошибка", show_alert=True)
+            return
+        card = guest_card(cb.from_user.id)
+        if card:   # карта уже есть — номер не спрашиваем
+            await cb.answer()
+            try:
+                await cb.message.edit_text(f"💎 Карта <b>{esc(card['phone'])}</b> уже привязана ✅")
+            except TelegramBadRequest:
+                pass
+            await state.update_data(loyal_done=True, card_greeted=True)
+            await _proceed((await state.get_data()).get("next") or "order", cb.message, state)
             return
         await state.update_data(loyal_type=kind)
         await cb.answer()
@@ -6852,6 +6897,13 @@ async def cb_rsv_pay(cb: CallbackQuery):
             show_alert=True,
         )
         return
+    if str(r["date"]) > _biz_today().isoformat():
+        await cb.answer(
+            f"⏳ Аренда ещё не наступила ({_ddmm(r['date'])} в {r['time']}). "
+            "Чек закрывают в день аренды — по факту времени.",
+            show_alert=True,
+        )
+        return
     if len(parts) == 2:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -6897,10 +6949,14 @@ async def cb_rsv_pay(cb: CallbackQuery):
 
 
 # ============================ КАРТА ЛОЯЛЬНОСТИ ==============================
-def kb_card(has_card: bool) -> InlineKeyboardMarkup:
+def kb_card(has_card: bool) -> InlineKeyboardMarkup | None:
+    """Номер карты гость оставляет один раз; сменить его может только админ (/guest)."""
     if has_card:
-        return InlineKeyboardMarkup(inline_keyboard=[[_btn("📱 Сменить номер карты", "lc:phone")]])
+        return None
     return InlineKeyboardMarkup(inline_keyboard=[[_btn("💳 Подключить карту", "lc:phone")]])
+
+
+CARD_PHONE_LOCKED = "Номер карты уже привязан. Сменить его может администратор заведения."
 
 
 async def _send_card(message: Message, state: FSMContext, uid: int) -> None:
@@ -6928,6 +6984,9 @@ async def on_my_card(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "lc:phone")
 async def cb_card_phone(cb: CallbackQuery, state: FSMContext):
+    if guest_card(cb.from_user.id):   # старая кнопка «Сменить номер» в прошлых сообщениях
+        await cb.answer(f"💎 {CARD_PHONE_LOCKED}", show_alert=True)
+        return
     await cb.answer()
     await state.update_data(next="card")
     await state.set_state(OrderFSM.phone)
@@ -6943,12 +7002,14 @@ class GuestFSM(StatesGroup):
     search = State()   # ввод телефона / @ника
     accrue = State()   # сумма чека вне бота → кешбэк
     spend = State()    # сколько баллов списать
+    phone = State()    # новый номер карты
 
 
 def kb_guest_admin(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("📊 Аналитика гостя", f"ga:an:{uid}")],
         [_btn("➕ Начислить за чек", f"ga:acc:{uid}"), _btn("➖ Списать баллы", f"ga:sp:{uid}")],
+        [_btn("📱 Сменить номер", f"ga:ph:{uid}")],
         [_btn("🔄 Обновить", f"ga:v:{uid}"), _btn("✖ Закрыть", "ga:close")],
     ])
 
@@ -7057,6 +7118,19 @@ async def cb_guest_admin(cb: CallbackQuery, state: FSMContext):
             )
             await cb.message.edit_text(prompt, reply_markup=_cancel_kb(f"ga:v:{uid}"))
             return
+        if parts[1] == "ph":
+            g = guest_card(uid)
+            await cb.answer()
+            await state.set_state(GuestFSM.phone)
+            await state.update_data(ga_uid=uid, ed_msg=cb.message.message_id)
+            await cb.message.edit_text(
+                f"📱 <b>Новый номер карты</b> для {esc(_guest_label(g, phone=False))}\n"
+                f"Сейчас: <b>{esc(g['phone'])}</b>\n\n"
+                "Отправьте новый номер (например +7 900 123-45-67). Баллы и история "
+                "останутся на карте, гостю придёт уведомление.",
+                reply_markup=_cancel_kb(f"ga:v:{uid}"),
+            )
+            return
         await cb.answer()
     except (ValueError, IndexError):
         await cb.answer("Некорректный запрос", show_alert=True)
@@ -7134,6 +7208,46 @@ async def guest_accrue_input(message: Message, state: FSMContext):
             f"💎 Начислено +{_fmt_pts(pts)} баллов за чек {_fmt_money(int(v))}. "
             f"Баланс: {_fmt_pts(db_bonus_balance(int(uid)))}",
         )
+
+
+@router.message(GuestFSM.phone, F.text)
+async def guest_phone_input(message: Message, state: FSMContext):
+    if not await _admin_msg_guard(message, state):
+        return
+    data = await state.get_data()
+    uid = data.get("ga_uid")
+    g = guest_card(uid) if uid else None
+    if not g:
+        await state.clear()
+        await message.answer("Карта не найдена — откройте /guest заново.")
+        return
+    phone = normalize_phone((message.text or "").strip())
+    if not phone:
+        await message.answer("Не похоже на номер. Пример: +7 900 123-45-67 — либо ✖ Отмена.")
+        return
+    if phone == g["phone"]:
+        await message.answer("Это и есть текущий номер карты. Введите другой, либо ✖ Отмена.")
+        return
+    ok, owner = db_guest_admin_set_phone(int(uid), phone)
+    if not ok:
+        who = f": {esc(_guest_label(owner))}" if owner else ""
+        await message.answer(f"⚠️ Номер {esc(phone)} уже привязан к другой карте{who}. "
+                             "Введите другой, либо ✖ Отмена.")
+        return
+    await state.clear()
+    logger.info("Админ %s сменил номер карты %s: %s → %s",
+                message.from_user.id, uid, g["phone"], phone)
+    await _edit_or_send(
+        message, data,
+        f"✅ Номер карты: {esc(g['phone'])} → <b>{esc(phone)}</b>\n\n"
+        + card_text(int(uid), for_admin=True),
+        kb_guest_admin(int(uid)),
+    )
+    await _notify_guest(
+        message.bot, int(uid),
+        f"📱 Номер вашей карты изменён администратором: <b>{esc(phone)}</b>. "
+        "Баллы и история сохранены.",
+    )
 
 
 @router.message(GuestFSM.spend, F.text)
@@ -8127,7 +8241,7 @@ async def cmd_help(message: Message, state: FSMContext):
             "/timing — время выдачи заказов\n"
             "/stock — остатки, себестоимость, 📜 история прихода и списаний\n"
             "/recipe — состав позиций для списания\n"
-            "/guest — карта гостя по телефону/@нику: аналитика, баллы, начислить, списать\n"
+            "/guest — карта гостя по телефону/@нику: аналитика, баллы, начислить, списать, сменить номер\n"
             "/loyalty — аналитика лояльности: топ гостей, «спящие», баллы\n\n"
             f"🤖 Версия бота: <b>{BOT_VERSION}</b>" + reg_note
         )
