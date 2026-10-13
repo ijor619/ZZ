@@ -99,7 +99,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("zigzag")
 
-BOT_VERSION = "2026-10-13-v11"
+BOT_VERSION = "2026-10-13-v12"
 
 # Все временные метки бота — московские (UTC+3, переход на летнее время отменён)
 _MSK = timezone(timedelta(hours=3), name="MSK")
@@ -5365,6 +5365,11 @@ async def cb_status(cb: CallbackQuery):
         )
         return
 
+    # предзаказ на завтра — гость ещё не пришёл (отмена и «Принят» — можно)
+    if code in ("ready", "issued", "paid") and _pre_too_early(order):
+        await cb.answer(_pre_early_msg(order), show_alert=True)
+        return
+
     # «Оплачен» — сначала спрашиваем у админа, как была произведена оплата
     if code == "paid":
         try:
@@ -5442,6 +5447,10 @@ async def cb_pay(cb: CallbackQuery):
         except TelegramBadRequest:
             pass
         await cb.answer("Отменили")
+        return
+
+    if order["status"] != "paid" and _pre_too_early(order):
+        await cb.answer(_pre_early_msg(order), show_alert=True)
         return
 
     if action in ("bonus", "nobonus"):
@@ -7775,6 +7784,24 @@ def _pre_when(o: dict) -> str:
     except (TypeError, ValueError):
         return "—"
     return f"{_wd(a)} {a:%d.%m} · {a:%H:%M}"
+
+
+def _pre_too_early(order: dict) -> bool:
+    """Предзаказ на БУДУЩИЙ рабочий день (смена 15:00–03:00): «Готов», «Выдан»
+    и «Оплачен» ставить ещё рано — гость не пришёл. Приход в 01:00 ночи —
+    это ещё смена предыдущей даты."""
+    if order.get("kind") != "pre" or not order.get("arrive_at"):
+        return False
+    try:
+        a = datetime.strptime(str(order["arrive_at"])[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+    return (a - timedelta(hours=RSV_CLOSE_H)).date() > _biz_today()
+
+
+def _pre_early_msg(order: dict) -> str:
+    return (f"⏳ Предзаказ к {_pre_when(order)} — день прихода ещё не наступил. "
+            "«Готов», «Выдан» и «Оплачен» — в день прихода. Отменить можно сейчас.")
 
 
 def _pre_days() -> list:
